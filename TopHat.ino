@@ -1,52 +1,65 @@
+/*
+  Tilt compensated HMC5883L + ADXL345 (GY-80). Output for HMC5883L_compensation_processing.pde
+  Read more: http://www.jarzebski.pl/arduino/czujniki-i-sensory/3-osiowy-magnetometr-hmc5883l.html
+  GIT: https://github.com/jarzebski/Arduino-HMC5883L
+  Web: http://www.jarzebski.pl
+  (c) 2014 by Korneliusz Jarzebski
+*/
 #include <TinyGPS++.h>
 #include <Wire.h>
-#include <Adafruit_Sensor.h>
-#include <Adafruit_HMC5883_U.h>
-TinyGPSPlus gps; // gps object
-
-Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(12345);
-
-// 12v LED Strip Light Definitions
-#define REDPIN 5
-#define GREENPIN 6
-#define BLUEPIN 3
-#define FADESPEED 8     // make this higher to slow down
-
-// SD Card configuration
+#include <HMC5883L.h>
+#include <ADXL345.h>
 #include <SPI.h>
 #include <SD.h>
 
 const int chipSelect = 10; //
 File myLocationFile;
-char curLocationFile[16]; // array for file name using char types no more than 16 characters long
+char curLocationFile[16];
 double doubleDestLong;
 double doubleDestLat;
 unsigned long last = 0UL;
 
-int Mag_adjustment()
-{
-  int result;
+HMC5883L compass;
+ADXL345 accelerometer;
+TinyGPSPlus gps;
 
-  sensors_event_t event;
-  mag.getEvent(&event);
-  float heading = atan2(event.magnetic.x, event.magnetic.y);
-  float declinationAngle = -0.19;
-  heading += declinationAngle;
-
-  //corrections
-  if(heading < 0)
-    heading += 2*PI;
-
-  if(heading > 2*PI)
-    heading -= 2*PI;
-
-  float headingDegrees = heading * 180/M_PI;
-  return headingDegrees;
-}
+float heading1;
+float heading2;
 
 void setup()
 {
   Serial.begin(9600);
+
+  // Initialize ADXL345
+
+  if (!accelerometer.begin())
+  {
+    delay(500);
+  }
+
+  accelerometer.setRange(ADXL345_RANGE_2G);
+
+  // Initialize Initialize HMC5883L
+  while (!compass.begin())
+  {
+    delay(500);
+  }
+
+  // Set measurement range
+  compass.setRange(HMC5883L_RANGE_1_3GA);
+
+  // Set measurement mode
+  compass.setMeasurementMode(HMC5883L_CONTINOUS);
+
+  // Set data rate
+  compass.setDataRate(HMC5883L_DATARATE_30HZ);
+
+  // Set number of samples averaged
+  compass.setSamples(HMC5883L_SAMPLES_8);
+
+  // Set calibration offset. See HMC5883L_calibration.ino
+  compass.setOffset(86, -351); 
+
   Serial.print("Reading SD Card...");
 
   if (!SD.begin(10)) { // Notifies user if it can't start the SD card
@@ -76,7 +89,7 @@ void setup()
     DestLong[i] = myLocationFile.read();
   }
   char *lat2; // no idea why this is here
-  doubleDestLong = atof(DestLong);
+  double doubleDestLong = atof(DestLong);
   Serial.print("Imported longitude from camplon.txt:   ");
   Serial.println(doubleDestLong, 6);
   myLocationFile.close();
@@ -94,38 +107,114 @@ void setup()
   char *lon2; //still no idea... will see try to remove after the rewrite
   doubleDestLat = atof(DestLat);
   Serial.print("Imported latitude from camplat.txt:   ");
-  Serial.println(doubleDestLat, 6);
+  Serial.println(doubleDestLat);
   myLocationFile.close();
   delay(5000);//close file
+}
 
-  if(!mag.begin())
+// No tilt compensation
+
+float noTiltCompensate(Vector mag)
+{
+  float heading = atan2(mag.YAxis, mag.XAxis);
+  return heading;
+}
+ 
+// Tilt compensation
+float tiltCompensate(Vector mag, Vector normAccel)
+{
+  // Pitch & Roll 
+
+  float roll;
+  float pitch;
+
+  roll = asin(normAccel.YAxis);
+  pitch = asin(-normAccel.XAxis);
+
+  if (roll > 0.78 || roll < -0.78 || pitch > 0.78 || pitch < -0.78)
   {
-    /* There was a problem detecting the HMC5883 ... check your connections */
-    Serial.println("Ooops, no HMC5883 detected ... Check your wiring!");
-    while(1);
+    return -1000;
   }
 
-  // LED Setup
-  pinMode(REDPIN, OUTPUT);
-  pinMode(GREENPIN, OUTPUT);
-  pinMode(BLUEPIN, OUTPUT);
+  // Some of these are used twice, so rather than computing them twice in the algorithem we precompute them before hand.
+  float cosRoll = cos(roll);
+  float sinRoll = sin(roll);  
+  float cosPitch = cos(pitch);
+  float sinPitch = sin(pitch);
+
+  // Tilt compensation
+  float Xh = mag.XAxis * cosPitch + mag.ZAxis * sinPitch;
+  float Yh = mag.XAxis * sinRoll * sinPitch + mag.YAxis * cosRoll - mag.ZAxis * sinRoll * cosPitch;
+
+  float heading = atan2(Yh, Xh);
+
+  return heading;
+}
+
+// Correct angle
+float correctAngle(float heading)
+{
+  if (heading < 0) { heading += 2 * PI; }
+  if (heading > 2 * PI) { heading -= 2 * PI; }
+
+  return heading;
 }
 
 void loop()
+{
+  // Read vectors
+  Vector mag = compass.readNormalize();
+  Vector acc = accelerometer.readScaled();
+
+  // Calculate headings
+  heading1 = noTiltCompensate(mag);
+  heading2 = tiltCompensate(mag, acc);
+
+  if (heading2 == -1000)
+  {
+    heading2 = heading1;
+  }
+
+  // Set declination angle on your location and fix heading
+  // You can find your declination on: http://magnetic-declination.com/
+  // (+) Positive or (-) for negative
+  // For Bytom / Poland declination angle is 4'26E (positive)
+  // Formula: (deg + (min / 60.0)) / (180 / M_PI);
+  float declinationAngle = (4.0 + (26.0 / 60.0)) / (180 / M_PI);
+  heading1 += declinationAngle;
+  heading2 += declinationAngle;
+
+  // Correct for heading < 0deg and heading > 360deg
+  heading1 = correctAngle(heading1);
+  heading2 = correctAngle(heading2);
+
+  // Convert to degrees
+  heading1 = heading1 * 180/M_PI; 
+  heading2 = heading2 * 180/M_PI; 
+
+  // Output
+  Serial.print(heading1);
+  Serial.print(":");
+  Serial.println(heading2);
+  delay(100);
+
 {
   // This sketch displays information every time a new sentence is correctly encoded.
   while (Serial.available() > 0)
     if (gps.encode(Serial.read()))
       displayInfo();
-      Serial.println(Mag_adjustment());
-      delay(2500);
 
   if (millis() > 5000 && gps.charsProcessed() < 10)
   {
     Serial.println(F("No GPS detected: check wiring."));
-    while (true);
+    while(true);
   }
 }
+
+
+
+}
+
 
 void displayInfo()
 {
@@ -193,12 +282,11 @@ void displayInfo()
       Serial.print(F(" degrees ["));
       Serial.println(F("]"));
 
-      if (gps.charsProcessed() < 10)
-        Serial.println(F("WARNING: No GPS data.  Check wiring."));
-
-        last = millis();
-        Serial.println();
-      }
+      Serial.println("Correct raw GPS heading to compass data:");
+  heading2 += gps.courseTo(gps.location.lat(), gps.location.lng(),CAMP_LAT, CAMP_LON);
+  if (heading2 > 360) heading2 = heading2 - 360;
+  Serial.print(heading2);
+  Serial.println(" degrees*******");
+    }
   }
 }
-
